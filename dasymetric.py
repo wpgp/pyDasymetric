@@ -5,13 +5,14 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, Optional
 
+import pandas as pd
 import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.features import rasterize
-from rasterio.windows import Window, bounds as window_bounds
+from rasterio.windows import Window, bounds as window_bounds, transform as window_transform
 
 logger = logging.getLogger("dasymetric")
 if not logger.handlers:
@@ -27,15 +28,19 @@ if not logger.handlers:
 @dataclass
 class DasymetricConfig:
     weight_raster_path: str
-    vector_path: str
+    pop_path: str
+    geom_path: str                          # optional mastergrid for zonal stats
     output_raster_path: str
     pop_field: str
+    mask_path: Optional[str] = None         # optional raster to constrain redistribution
     id_field: Optional[str] = None          # auto-generated if None
-    nodata: float = -1.0
+    reference_layer: str = "weight"         # "weight" or "mastergrid" or "vector"
+    nodata: float = -99999.
     block_size: int = 512                   # pixels per side of a processing window
     n_workers: int = field(default_factory=lambda: max(1, (mp.cpu_count() or 2) - 1))
     output_dtype: str = "float32"
     weight_floor: float = 0.0               # pixels with weight <= this are excluded
+    max_windows: Optional[int] = 256           # for testing, limit number of windows processed
 
 
 # --------------------------------------------------------------------------- #
@@ -67,141 +72,139 @@ class WeightRasterSource:
 class VectorPopulationLayer:
     """Wraps the admin-unit vector layer and its population attribute."""
 
-    def __init__(self, path: str, pop_field: str, id_field: Optional[str] = None):
-        self.path = path
+    def __init__(self, 
+                 pop_path: str, 
+                 geom_path: str, 
+                 pop_field: str, 
+                 id_field: Optional[str] = '_zone_id'
+                 ):
+        self.pop_path = pop_path
+        self.geom_path = geom_path
         self.pop_field = pop_field
-        self.gdf = gpd.read_file(path)
+        self.id_field = id_field
+        self.has_mastergrid = False
 
-        if self.pop_field not in self.gdf.columns:
-            raise ValueError(f"'{pop_field}' not found in vector attributes")
-
-        if id_field is None:
-            self.id_field = "_zone_id"
-            self.gdf[self.id_field] = np.arange(1, len(self.gdf) + 1, dtype=np.int32)
+        ext = Path(geom_path).suffix.lower()
+        if ext in [".tif"]:
+            self.has_mastergrid = True
+            self.pop_df = pd.read_csv(pop_path)[[id_field, pop_field]]
+        elif ext in [".shp", ".gpkg", ".geojson"]:
+            self.pop_df = pd.DataFrame(gpd.read_file(geom_path)[[id_field, pop_field]])
         else:
-            if id_field not in self.gdf.columns:
-                raise ValueError(f"'{id_field}' not found in vector attributes")
-            self.id_field = id_field
+            self.pop_df = pd.read_csv(pop_path)
 
-        # zone id 0 is reserved to mean "no zone" during rasterisation
-        if (self.gdf[self.id_field] == 0).any():
-            raise ValueError("zone id 0 is reserved; re-map ids so none are 0")
-
-    def reproject_to(self, crs) -> "VectorPopulationLayer":
-        if self.gdf.crs != crs:
-            self.gdf = self.gdf.to_crs(crs)
-        return self
+        # zone id -1 is reserved to mean "no zone" during rasterisation
+        if (self.pop_df[id_field] == -1).any():
+            raise ValueError("zone id -1 is reserved; re-map ids so none are -1")
 
     def total_population(self) -> float:
-        return float(self.gdf[self.pop_field].sum())
+        return float(self.pop_df[self.pop_field].sum())
 
     def materialize(self, out_path: str) -> str:
         """Persist the (possibly reprojected) layer so worker processes can
         each open their own independent, bbox-filterable copy."""
-        self.gdf.to_file(out_path, driver="GPKG")
+        self.pop_df.to_csv(out_path, index=False)
         return out_path
 
 
 # --------------------------------------------------------------------------- #
 # Worker functions (module-level so they are picklable for multiprocessing)
 # --------------------------------------------------------------------------- #
-def _read_weight_block(weight_path: str, window: Window):
-    with rasterio.open(weight_path) as src:
+def _read_by_block(path: str, window: Window):
+    with rasterio.open(path) as src:
         block = src.read(1, window=window).astype("float64")
-        transform = src.window_transform(window)
+        if window is not None:
+            transform = src.window_transform(window)
+        else:
+            transform = src.transform
         nodata = src.nodata
     return block, transform, nodata
 
 
-def _rasterize_zones(vector_path: str, id_field: str, transform, shape, bounds):
-    """Read only the features intersecting this window's bounds and burn
-    their zone id into an integer raster aligned with the weight block."""
-    gdf = gpd.read_file(vector_path, bbox=bounds)
-    if gdf.empty:
-        return None, gdf
-    shapes = list(zip(gdf.geometry, gdf[id_field].astype("int32")))
-    zone_raster = rasterize(
-        shapes, out_shape=shape, transform=transform, fill=0, dtype="int32"
-    )
-    return zone_raster, gdf
-
-
-def _valid_mask(weight: np.ndarray, weight_nodata, zone_raster: np.ndarray, weight_floor: float):
+def _valid_mask(weight: np.ndarray, weight_nodata, zone_raster: np.ndarray, weight_floor: float) -> np.ndarray:
     valid = np.isfinite(weight)
     if weight_nodata is not None:
         valid &= weight != weight_nodata
     valid &= weight > weight_floor
-    valid &= zone_raster != 0
+    valid &= zone_raster != -1
+
     return valid
+
+
+def _rasterize_zones(
+        window: Window,
+        vector_path: str,
+        id_field: str,
+        transform, shape, bounds = None,
+        mask_path: Optional[str] = None
+        ):
+    """Rasterize the features intersecting this window's bounds, optionally
+    applying a mask to constrain the output."""
+    gdf = gpd.read_file(vector_path, bbox=bounds)
+    if gdf.empty:
+        return np.full(shape, -1, dtype="int32")
+    
+    shapes = list(zip(gdf.geometry, gdf[id_field].astype("int32")))
+    zone_raster = rasterize(
+        shapes, out_shape=shape, transform=transform, fill=-1, dtype="int32"
+    )
+    if mask_path is not None:
+        with rasterio.open(mask_path) as src:
+            mask = src.read(1, window=window).astype("bool")
+        zone_raster[~mask] = -1
+    
+    return window, zone_raster
 
 
 def _compute_partial_zone_sums(
     window: Window,
     weight_path: str,
-    vector_path: str,
-    id_field: str,
+    mastergrid_path: str,
     weight_floor: float,
-) -> Dict[int, float]:
+):
     """Pass 1 worker: sum of weight pixels per zone, within one window."""
-    weight, transform, wnodata = _read_weight_block(weight_path, window)
-    b = window_bounds(window, transform)
-    zone_raster, _ = _rasterize_zones(vector_path, id_field, transform, weight.shape, b)
-    if zone_raster is None:
-        return {}
-
+    weight, _, wnodata = _read_by_block(weight_path, window)
+    
+    with rasterio.open(mastergrid_path) as mst:
+        zone_raster = mst.read(1, window=window)
+            
     valid = _valid_mask(weight, wnodata, zone_raster, weight_floor)
     if not valid.any():
-        return {}
+        return None
 
-    zones = zone_raster[valid]
-    vals = weight[valid]
-    order = np.argsort(zones)
-    zones_sorted = zones[order]
-    vals_sorted = vals[order]
-    uniq, start_idx = np.unique(zones_sorted, return_index=True)
-    sums = np.add.reduceat(vals_sorted, start_idx)
-    return {int(z): float(s) for z, s in zip(uniq, sums)}
+    df = pd.DataFrame()
+    df['zones'] = zone_raster[valid].flatten()
+    df['weights'] = weight[valid].flatten()
+    agg = df.groupby('zones')['weights'].sum().reset_index()
+    
+    return agg
 
 
 def _redistribute_window(
     window: Window,
     weight_path: str,
-    vector_path: str,
+    mastergrid_path: str,
+    zone_sums: pd.DataFrame,
     id_field: str,
-    pop_field: str,
-    zone_sums: Dict[int, float],
     nodata: float,
-    weight_floor: float,
     out_dtype: str,
-) -> Tuple[Window, np.ndarray]:
+):
     """Pass 2 worker: convert one window's weights into population estimates."""
-    weight, transform, wnodata = _read_weight_block(weight_path, window)
-    out = np.full(weight.shape, nodata, dtype=out_dtype)
+    weight, transform, wnodata = _read_by_block(weight_path, window)
+    
+    with rasterio.open(mastergrid_path) as mst:
+        zone_raster = mst.read(1, window=window).astype("float32")
+        zone_raster[zone_raster == -1] = np.nan
 
-    b = window_bounds(window, transform)
-    zone_raster, gdf = _rasterize_zones(vector_path, id_field, transform, weight.shape, b)
-    if zone_raster is None:
-        return window, out
+    lookup_dict = zone_sums.set_index(id_field)["norm"].to_dict()
+    updater = np.vectorize(lambda x: lookup_dict.get(x, 0))
+    norm = updater(zone_raster)
 
-    valid = _valid_mask(weight, wnodata, zone_raster, weight_floor)
-    if not valid.any():
-        return window, out
+    out = weight * norm
+    out[~np.isfinite(norm)] = nodata
+    out = out.astype(out_dtype)
 
-    pop_lookup = dict(zip(gdf[id_field].astype("int32"), gdf[pop_field].astype("float64")))
-    result = np.zeros(weight.shape, dtype="float64")
-
-    for z in np.unique(zone_raster[valid]):
-        z = int(z)
-        zsum = zone_sums.get(z, 0.0)
-        pop = pop_lookup.get(z, 0.0)
-        if zsum <= 0 or pop <= 0:
-            continue
-        mask = valid & (zone_raster == z)
-        result[mask] = weight[mask] / zsum * pop
-
-    out[valid] = result[valid].astype(out_dtype)
     return window, out
-
 
 # --------------------------------------------------------------------------- #
 # Orchestrator
@@ -213,26 +216,37 @@ class DasymetricRedistributor:
         self.config = config
         self.weight_source = WeightRasterSource(config.weight_raster_path, config.block_size)
         self.vector_layer = VectorPopulationLayer(
-            config.vector_path, config.pop_field, config.id_field
-        ).reproject_to(self.weight_source.crs)
-
-        self._tmp_vector_path = str(
-            Path(config.output_raster_path).with_suffix("").as_posix() + "_zones_tmp.gpkg"
+            config.pop_path, config.geom_path, config.pop_field, config.id_field
         )
-        self.vector_layer.materialize(self._tmp_vector_path)
-        self._zone_sums: Optional[Dict[int, float]] = None
+
+        self.n_windows = len(list(self.weight_source.windows()))
+
+        if not self.vector_layer.has_mastergrid:
+            self._create_mastergrid()
+
+        #self.vector_layer.materialize(self._tmp_vector_path)
+        self._zone_sums = None
 
     # -- public API --------------------------------------------------------
     def run(self) -> "DasymetricRedistributor":
-        logger.info("Pass 1/2: computing per-zone weight sums (%d workers)", self.config.n_workers)
-        self._zone_sums = self._compute_zone_sums()
+        logger.info("Pass 1/2: computing per-zone weight sums (%d windows, %d workers)", self.n_windows, self.config.n_workers)
+        zone_sums = self._compute_zone_sums()
+        zone_sums = zone_sums.merge(
+            self.vector_layer.pop_df,
+            on=self.config.id_field, how='left')
+        zone_sums['norm'] = np.divide(
+            zone_sums[self.config.pop_field].values,
+            zone_sums['weights'].values, 
+            out=np.zeros_like(zone_sums['weights'].values),
+            where=zone_sums['weights'].values!=0)
+        self._zone_sums = zone_sums
 
-        logger.info("Pass 2/2: redistributing population (%d workers)", self.config.n_workers)
-        self._write_output(self._zone_sums)
+        logger.info("Pass 2/2: redistributing population (%d windows, %d workers)", self.n_windows, self.config.n_workers)
+        self._redistribute()
 
-        self._cleanup()
-        logger.info("Done. Output written to %s", self.config.output_raster_path)
-        return self
+        #self._cleanup()
+        #logger.info("Done. Output written to %s", self.config.output_raster_path)
+        #return self
 
     def verify(self) -> Dict[str, float]:
         """Sanity check: total input population vs. total output population.
@@ -255,61 +269,125 @@ class DasymetricRedistributor:
         }
 
     # -- internal ------------------------------------------------------------
-    def _compute_zone_sums(self) -> Dict[int, float]:
+    def _create_mastergrid(self) -> None:
+        """If the user did not provide a mastergrid, create one by rasterizing
+        the vector layer into the weight raster's CRS and extent."""
+        if self.vector_layer.has_mastergrid:
+            return
+
+        logger.info("Creating mastergrid from vector layer...")
         windows = list(self.weight_source.windows())
-        totals: Dict[int, float] = {}
+        out_path = self.config.output_raster_path.replace(".tif", "_mastergrid.tif")
+        self.config.geom_path = out_path
+        profile = self.weight_source.profile.copy()
+        profile.update(dtype="int32", nodata=-1)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            if self.n_windows < self.config.max_windows:
+                logger.info("Rasterizing mastergrid in a single pass (small raster)...")
+                w, zone_raster = _rasterize_zones(
+                    None,
+                    self.vector_layer.geom_path, 
+                    self.vector_layer.id_field, 
+                    self.weight_source.transform, 
+                    (self.weight_source.height, self.weight_source.width),
+                    mask_path=self.config.mask_path
+                    )
+
+                dst.write(zone_raster.astype("int32"), 1)
+            else:
+                logger.info("Rasterizing mastergrid in parallel (%d windows, %d workers)...", self.n_windows, self.config.n_workers)
+                with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
+                    futures = [
+                        ex.submit(
+                            _rasterize_zones,
+                            w,
+                            self.vector_layer.geom_path,
+                            self.vector_layer.id_field,
+                            window_transform(w, self.weight_source.transform),
+                            (w.height, w.width),
+                            window_bounds(w, self.weight_source.transform),
+                            self.config.mask_path
+                        )
+                        for w in windows
+                    ]
+                    self.futures = futures
+
+                    for fut in as_completed(futures):
+                        w, zone_raster = fut.result()
+                        dst.write(zone_raster.astype("int32"), 1, window=w)
+
+    def _compute_zone_sums(self):
+        windows = list(self.weight_source.windows())
+        
         with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
             futures = [
                 ex.submit(
                     _compute_partial_zone_sums,
                     w,
                     self.config.weight_raster_path,
-                    self._tmp_vector_path,
-                    self.vector_layer.id_field,
+                    self.config.geom_path,
                     self.config.weight_floor,
                 )
                 for w in windows
             ]
-            for fut in as_completed(futures):
-                for z, s in fut.result().items():
-                    totals[z] = totals.get(z, 0.0) + s
-        return totals
 
-    def _write_output(self, zone_sums: Dict[int, float]) -> None:
+            totals = []
+
+            for fut in as_completed(futures):
+                totals.append(fut.result())
+
+            stack = pd.concat(totals, ignore_index=True)
+            stack.rename(columns={'zones': self.config.id_field}, inplace=True)
+            stack = stack.groupby(self.config.id_field)['weights'].sum().reset_index()
+        return stack
+
+    def _redistribute(self):
         profile = self.weight_source.profile.copy()
         profile.update(
             dtype=self.config.output_dtype,
             count=1,
             nodata=self.config.nodata,
-            compress="lzw",
-            tiled=True,
-            blockxsize=min(256, self.config.block_size),
-            blockysize=min(256, self.config.block_size),
+            blockxsize=min(512, self.config.block_size),
+            blockysize=min(512, self.config.block_size),
             BIGTIFF="IF_SAFER",
         )
         windows = list(self.weight_source.windows())
 
         with rasterio.open(self.config.output_raster_path, "w", **profile) as dst:
-            with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
-                futures = [
-                    ex.submit(
-                        _redistribute_window,
-                        w,
-                        self.config.weight_raster_path,
-                        self._tmp_vector_path,
-                        self.vector_layer.id_field,
-                        self.config.pop_field,
-                        zone_sums,
-                        self.config.nodata,
-                        self.config.weight_floor,
-                        self.config.output_dtype,
-                    )
-                    for w in windows
-                ]
-                # Only the main process writes -> no concurrent-write issues.
-                for fut in as_completed(futures):
-                    window, arr = fut.result()
-                    dst.write(arr, 1, window=window)
+
+            if self.n_windows < self.config.max_windows:
+                logger.info("Redistributing population in a single pass (small raster)...")
+                w, arr = _redistribute_window(
+                    None,
+                    self.config.weight_raster_path,
+                    self.config.geom_path,
+                    self._zone_sums,
+                    self.config.id_field,
+                    self.config.nodata,
+                    self.config.output_dtype,
+                )
+                dst.write(arr, 1)
+            else:
+                logger.info("Redistributing population in parallel (%d windows, %d workers)...", self.n_windows, self.config.n_workers)
+                with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
+                    futures = [
+                        ex.submit(
+                            _redistribute_window,
+                            w,
+                            self.config.weight_raster_path,
+                            self.config.geom_path,
+                            self._zone_sums,
+                            self.config.id_field,
+                            self.config.nodata,
+                            self.config.output_dtype,
+                        )
+                        for w in windows
+                    ]
+                    # Only the main process writes -> no concurrent-write issues.
+                    for fut in as_completed(futures):
+                        w, arr = fut.result()
+                        dst.write(arr, 1, window=w)
 
     def _cleanup(self) -> None:
         p = Path(self._tmp_vector_path)
