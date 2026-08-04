@@ -194,7 +194,7 @@ def _redistribute_window(
     
     with rasterio.open(mastergrid_path) as mst:
         zone_raster = mst.read(1, window=window).astype("float32")
-        zone_raster[zone_raster == -1] = np.nan
+        zone_raster[zone_raster == mst.nodata] = np.nan
 
     lookup_dict = zone_sums.set_index(id_field)["norm"].to_dict()
     updater = np.vectorize(lambda x: lookup_dict.get(x, 0))
@@ -203,6 +203,7 @@ def _redistribute_window(
     out = weight * norm
     out[~np.isfinite(norm)] = nodata
     out = out.astype(out_dtype)
+    print('done')
 
     return window, out
 
@@ -231,7 +232,7 @@ class DasymetricRedistributor:
     def run(self) -> "DasymetricRedistributor":
         logger.info("Pass 1/2: computing per-zone weight sums (%d windows, %d workers)", self.n_windows, self.config.n_workers)
         zone_sums = self._compute_zone_sums()
-        zone_sums = zone_sums.merge(
+        zone_sums = pd.merge(zone_sums,
             self.vector_layer.pop_df,
             on=self.config.id_field, how='left')
         zone_sums['norm'] = np.divide(
@@ -239,7 +240,7 @@ class DasymetricRedistributor:
             zone_sums['weights'].values, 
             out=np.zeros_like(zone_sums['weights'].values),
             where=zone_sums['weights'].values!=0)
-        self._zone_sums = zone_sums
+        self._zone_sums = zone_sums.copy()
 
         logger.info("Pass 2/2: redistributing population (%d windows, %d workers)", self.n_windows, self.config.n_workers)
         self._redistribute()
