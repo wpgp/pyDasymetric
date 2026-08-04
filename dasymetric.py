@@ -11,8 +11,11 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 import rasterio
+import threading
+
 from rasterio.features import rasterize
 from rasterio.windows import Window, bounds as window_bounds, transform as window_transform
+from utils import fill_nearest
 
 logger = logging.getLogger("dasymetric")
 if not logger.handlers:
@@ -35,12 +38,12 @@ class DasymetricConfig:
     mask_path: Optional[str] = None         # optional raster to constrain redistribution
     id_field: Optional[str] = None          # auto-generated if None
     reference_layer: str = "weight"         # "weight" or "mastergrid" or "vector"
+    nibble_mastergrid: bool = False         # whether to fill invalid pixels in mastergrid with nearest valid zone id
     nodata: float = -99999.
     block_size: int = 512                   # pixels per side of a processing window
     n_workers: int = field(default_factory=lambda: max(1, (mp.cpu_count() or 2) - 1))
     output_dtype: str = "float32"
-    weight_floor: float = 0.0               # pixels with weight <= this are excluded
-    max_windows: Optional[int] = 256           # for testing, limit number of windows processed
+    max_windows: Optional[int] = 256        # for testing, limit number of windows processed
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +145,7 @@ def _rasterize_zones(
     applying a mask to constrain the output."""
     gdf = gpd.read_file(vector_path, bbox=bounds)
     if gdf.empty:
-        return np.full(shape, -1, dtype="int32")
+        return window, np.full(shape, -1, dtype="int32")
     
     shapes = list(zip(gdf.geometry, gdf[id_field].astype("int32")))
     zone_raster = rasterize(
@@ -152,28 +155,40 @@ def _rasterize_zones(
         with rasterio.open(mask_path) as src:
             mask = src.read(1, window=window).astype("bool")
         zone_raster[~mask] = -1
-    
-    return window, zone_raster
 
+    return (window, zone_raster)
+
+
+def nibble_zones(
+        window: Window,
+        mastergrid_path: str, 
+        template_path: str):
+    """Fill any -1 pixels in zone_raster with the nearest valid zone id,
+    constrained to pixels that have valid weight values."""
+
+    master, _, mnodata = _read_by_block(mastergrid_path, window)
+    templa, _, tnodata = _read_by_block(template_path, window)
+
+    mask = np.logical_and(master == mnodata, templa == tnodata)
+    if not np.any(mask):
+        return master
+
+    filled = fill_nearest(master, mask)
+    return filled
 
 def _compute_partial_zone_sums(
     window: Window,
     weight_path: str,
-    mastergrid_path: str,
-    weight_floor: float,
+    mastergrid_path: str
 ):
     """Pass 1 worker: sum of weight pixels per zone, within one window."""
     weight, _, wnodata = _read_by_block(weight_path, window)
+    master, _, mnodata = _read_by_block(mastergrid_path, window)
     
-    with rasterio.open(mastergrid_path) as mst:
-        zone_raster = mst.read(1, window=window)
-            
-    valid = _valid_mask(weight, wnodata, zone_raster, weight_floor)
-    if not valid.any():
-        return None
-
+    valid = np.logical_and(weight != wnodata, master != mnodata)
+    
     df = pd.DataFrame()
-    df['zones'] = zone_raster[valid].flatten()
+    df['zones'] = master[valid].flatten()
     df['weights'] = weight[valid].flatten()
     agg = df.groupby('zones')['weights'].sum().reset_index()
     
@@ -190,20 +205,18 @@ def _redistribute_window(
     out_dtype: str,
 ):
     """Pass 2 worker: convert one window's weights into population estimates."""
-    weight, transform, wnodata = _read_by_block(weight_path, window)
-    
-    with rasterio.open(mastergrid_path) as mst:
-        zone_raster = mst.read(1, window=window).astype("float32")
-        zone_raster[zone_raster == mst.nodata] = np.nan
+    weight, _, wnodata = _read_by_block(weight_path, window)
+    master, _, mnodata = _read_by_block(mastergrid_path, window)
 
     lookup_dict = zone_sums.set_index(id_field)["norm"].to_dict()
-    updater = np.vectorize(lambda x: lookup_dict.get(x, 0))
-    norm = updater(zone_raster)
+    updater = np.vectorize(lambda x: lookup_dict.get(x, 0.0), otypes=[np.float32])
+    norm = updater(master)
 
+    masked = np.logical_or(weight == wnodata, master == mnodata)
     out = weight * norm
     out[~np.isfinite(norm)] = nodata
     out = out.astype(out_dtype)
-    print('done')
+    out[masked] = nodata
 
     return window, out
 
@@ -215,6 +228,7 @@ class DasymetricRedistributor:
 
     def __init__(self, config: DasymetricConfig):
         self.config = config
+
         self.weight_source = WeightRasterSource(config.weight_raster_path, config.block_size)
         self.vector_layer = VectorPopulationLayer(
             config.pop_path, config.geom_path, config.pop_field, config.id_field
@@ -225,12 +239,13 @@ class DasymetricRedistributor:
         if not self.vector_layer.has_mastergrid:
             self._create_mastergrid()
 
-        #self.vector_layer.materialize(self._tmp_vector_path)
+        if self.config.nibble_mastergrid:
+            self._nibble_mastergrid()
+
         self._zone_sums = None
 
     # -- public API --------------------------------------------------------
     def run(self) -> "DasymetricRedistributor":
-        logger.info("Pass 1/2: computing per-zone weight sums (%d windows, %d workers)", self.n_windows, self.config.n_workers)
         zone_sums = self._compute_zone_sums()
         zone_sums = pd.merge(zone_sums,
             self.vector_layer.pop_df,
@@ -242,12 +257,9 @@ class DasymetricRedistributor:
             where=zone_sums['weights'].values!=0)
         self._zone_sums = zone_sums.copy()
 
-        logger.info("Pass 2/2: redistributing population (%d windows, %d workers)", self.n_windows, self.config.n_workers)
         self._redistribute()
 
-        #self._cleanup()
-        #logger.info("Done. Output written to %s", self.config.output_raster_path)
-        #return self
+        logger.info("Done. Output written to %s", self.config.output_raster_path)
 
     def verify(self) -> Dict[str, float]:
         """Sanity check: total input population vs. total output population.
@@ -318,6 +330,44 @@ class DasymetricRedistributor:
                         w, zone_raster = fut.result()
                         dst.write(zone_raster.astype("int32"), 1, window=w)
 
+    def _nibble_mastergrid(self) -> None:
+        """Fill any -1 pixels in the mastergrid with the nearest valid zone id,
+        constrained to pixels that have valid weight values."""
+        if not self.vector_layer.has_mastergrid:
+            return
+
+        logger.info("Nibbling mastergrid to fill gaps...")
+        windows = list(self.weight_source.windows())
+        out_path = self.config.output_raster_path.replace(".tif", "_mastergrid_nibbled.tif")
+        self.config.geom_path = out_path
+        profile = self.weight_source.profile.copy()
+        profile.update(dtype="int32", nodata=-1)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            if self.n_windows < self.config.max_windows:
+                logger.info("Nibbling mastergrid in a single pass (small raster)...")
+                w, arr = nibble_zones(
+                    None,
+                    self.config.geom_path,
+                    self.config.weight_raster_path
+                )
+                dst.write(arr.astype("int32"), 1)
+            else:
+                logger.info("Nibbling mastergrid in parallel (%d windows, %d workers)...", self.n_windows, self.config.n_workers)
+                with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
+                    futures = [
+                        ex.submit(
+                            nibble_zones,
+                            w,
+                            self.config.geom_path,
+                            self.config.weight_raster_path
+                        )
+                        for w in windows
+                    ]
+                    for fut in as_completed(futures):
+                        w, arr = fut.result()
+                        dst.write(arr.astype("int32"), 1, window=w)
+
     def _compute_zone_sums(self):
         windows = list(self.weight_source.windows())
         
@@ -328,7 +378,6 @@ class DasymetricRedistributor:
                     w,
                     self.config.weight_raster_path,
                     self.config.geom_path,
-                    self.config.weight_floor,
                 )
                 for w in windows
             ]
@@ -390,15 +439,6 @@ class DasymetricRedistributor:
                         w, arr = fut.result()
                         dst.write(arr, 1, window=w)
 
-    def _cleanup(self) -> None:
-        p = Path(self._tmp_vector_path)
-        for sibling in p.parent.glob(p.stem + ".*"):
-            try:
-                sibling.unlink()
-            except OSError:
-                pass
-
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -407,9 +447,11 @@ def _cli() -> None:
 
     parser = argparse.ArgumentParser(description="Dasymetric population redistribution")
     parser.add_argument("weight_raster")
-    parser.add_argument("vector_path")
+    parser.add_argument("pop_path")
+    parser.add_argument("geom_path")
     parser.add_argument("pop_field")
     parser.add_argument("output_raster")
+    parser.add_argument("--mask-path", default=None)    
     parser.add_argument("--id-field", default=None)
     parser.add_argument("--block-size", type=int, default=512)
     parser.add_argument("--workers", type=int, default=max(1, (mp.cpu_count() or 2) - 1))
@@ -419,10 +461,12 @@ def _cli() -> None:
 
     config = DasymetricConfig(
         weight_raster_path=args.weight_raster,
-        vector_path=args.vector_path,
+        pop_path=args.pop_path,
+        geom_path=args.geom_path,
         output_raster_path=args.output_raster,
         pop_field=args.pop_field,
         id_field=args.id_field,
+        mask_path=args.mask_path,
         block_size=args.block_size,
         n_workers=args.workers,
         nodata=args.nodata,
@@ -432,5 +476,5 @@ def _cli() -> None:
     logger.info("Verification: %s", job.verify())
 
 
-#if __name__ == "__main__":
-#    _cli()
+if __name__ == "__main__":
+    _cli()

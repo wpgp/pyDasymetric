@@ -6,8 +6,8 @@ Given:
   * A raster of relative "weights" (probability / suitability / density proxy
     for human presence — e.g. built-up area fraction, night-lights, land cover
     likelihood surface).
-  * A vector layer of administrative units, each carrying a total population
-    count.
+  * A population layer containing total population count per administrative unit.
+  * A geometry layer describing the administrative unit boundary.
 
 This produces a raster where each pixel holds an estimate of population,
 computed as:
@@ -31,22 +31,28 @@ Usage
     from dasymetric import DasymetricConfig, DasymetricRedistributor
 
     config = DasymetricConfig(
-        weight_raster_path="weight.tif",
-        vector_path="admin_units.gpkg",
-        output_raster_path="population_dasymetric.tif",
-        pop_field="population",
-        id_field="admin_id",     # optional; auto-generated if omitted
-        block_size=1024,
-        n_workers=8,
+        weight_raster_path="covariates/slope_weight.tif",
+        pop_path="data/county_data.shp",
+        geom_path="data/county_data.shp",
+        mask_path="masks/urban_mask.tif",  # Masking raster
+        pop_field="POP_EST",
+        id_field="COUNTY_FP",
+        output_raster_path="output/urban_pop_disaggregated.tif",
+        n_workers=8
     )
-    job = DasymetricRedistributor(config)
-    job.run()
-    report = job.verify()
-    print(report)
+
+    DasymetricRedistributor(config).run()
 
 Or from the command line:
 
-    python dasymetric.py weight.tif admin_units.gpkg pop_field out.tif \
-        --id-field admin_id --block-size 1024 --workers 8
-"""
+    python dasymetric.py \\
+    path/to/weight_raster.tif \\
+    path/to/vector_zones.shp \\
+    POP_FIELD \\
+    path/to/output_population.tif \\
+    --id-field ZONE_ID \\
+    --workers 4 \\
+    --block-size 512 \\
+    --weight-floor 0.0
+
 
