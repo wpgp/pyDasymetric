@@ -31,14 +31,17 @@ Usage
     from dasymetric import DasymetricConfig, DasymetricRedistributor
 
     config = DasymetricConfig(
-        weight_raster_path="covariates/slope_weight.tif",
-        pop_path="data/county_data.shp",
-        geom_path="data/county_data.shp",
-        mask_path="masks/urban_mask.tif",  # Masking raster
+        weight_raster_path="covariates/viirs_2024.tif",
+        pop_path="data/pop_count.csv",
+        geom_path="data/adm_boundary.shp",
+        mask_path="masks/settlement_mask.tif",  # Masking raster
         pop_field="POP_EST",
         id_field="COUNTY_FP",
-        output_raster_path="output/urban_pop_disaggregated.tif",
-        n_workers=8
+        nibble=True,
+        output_raster_path="out/urban_pop_disaggregated.tif",
+        n_workers=8,
+        max_blocks=128
+        block_size=512
     )
 
     DasymetricRedistributor(config).run()
@@ -47,12 +50,12 @@ Or from the command line:
 
     python dasymetric.py \\
     path/to/weight_raster.tif \\
-    path/to/vector_zones.shp \\
+    path/to/mastergrid.tif \\
+    path/to/pop_count.csv \\
+    ID_FIELD \\
     POP_FIELD \\
     path/to/output_population.tif \\
-    --id-field ZONE_ID \\
     --workers 4 \\
-    --block-size 512 \\
-    --weight-floor 0.0
+    --block-size 512
 
 

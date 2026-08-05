@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from doctest import master
 import logging
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -11,7 +12,6 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 import rasterio
-import threading
 
 from rasterio.features import rasterize
 from rasterio.windows import Window, bounds as window_bounds, transform as window_transform
@@ -32,18 +32,17 @@ if not logger.handlers:
 class DasymetricConfig:
     weight_raster_path: str
     pop_path: str
-    geom_path: str                          # optional mastergrid for zonal stats
+    geom_path: str
     output_raster_path: str
+    id_field: str
     pop_field: str
-    mask_path: Optional[str] = None         # optional raster to constrain redistribution
-    id_field: Optional[str] = None          # auto-generated if None
-    reference_layer: str = "weight"         # "weight" or "mastergrid" or "vector"
-    nibble_mastergrid: bool = False         # whether to fill invalid pixels in mastergrid with nearest valid zone id
+    mask_path: Optional[str] = None          # optional raster to constrain redistribution
+    nibble: Optional[bool] = False           # whether to fill invalid pixels in mastergrid with nearest valid zone id
     nodata: float = -99999.
-    block_size: int = 512                   # pixels per side of a processing window
+    block_size: int = 512                    # pixels per side of a processing window
     n_workers: int = field(default_factory=lambda: max(1, (mp.cpu_count() or 2) - 1))
     output_dtype: str = "float32"
-    max_windows: Optional[int] = 256        # for testing, limit number of windows processed
+    max_blocks: Optional[int] = 256         # for testing, limit number of windows processed
 
 
 # --------------------------------------------------------------------------- #
@@ -90,11 +89,17 @@ class VectorPopulationLayer:
         ext = Path(geom_path).suffix.lower()
         if ext in [".tif"]:
             self.has_mastergrid = True
-            self.pop_df = pd.read_csv(pop_path)[[id_field, pop_field]]
+            self.pop_df = pd.read_csv(pop_path)
         elif ext in [".shp", ".gpkg", ".geojson"]:
-            self.pop_df = pd.DataFrame(gpd.read_file(geom_path)[[id_field, pop_field]])
+            self.pop_df = pd.DataFrame(gpd.read_file(geom_path))
         else:
             self.pop_df = pd.read_csv(pop_path)
+
+        if self.id_field not in self.pop_df.columns:
+            raise ValueError(f"ID field '{id_field}' not found in population data")
+            return
+
+        self.pop_df = self.pop_df[[self.id_field, self.pop_field]].copy()
 
         # zone id -1 is reserved to mean "no zone" during rasterisation
         if (self.pop_df[id_field] == -1).any():
@@ -124,22 +129,11 @@ def _read_by_block(path: str, window: Window):
     return block, transform, nodata
 
 
-def _valid_mask(weight: np.ndarray, weight_nodata, zone_raster: np.ndarray, weight_floor: float) -> np.ndarray:
-    valid = np.isfinite(weight)
-    if weight_nodata is not None:
-        valid &= weight != weight_nodata
-    valid &= weight > weight_floor
-    valid &= zone_raster != -1
-
-    return valid
-
-
-def _rasterize_zones(
+def _rasterize_block(
         window: Window,
         vector_path: str,
         id_field: str,
-        transform, shape, bounds = None,
-        mask_path: Optional[str] = None
+        transform, shape, bounds = None
         ):
     """Rasterize the features intersecting this window's bounds, optionally
     applying a mask to constrain the output."""
@@ -151,15 +145,11 @@ def _rasterize_zones(
     zone_raster = rasterize(
         shapes, out_shape=shape, transform=transform, fill=-1, dtype="int32"
     )
-    if mask_path is not None:
-        with rasterio.open(mask_path) as src:
-            mask = src.read(1, window=window).astype("bool")
-        zone_raster[~mask] = -1
 
     return (window, zone_raster)
 
 
-def nibble_zones(
+def _nibble_block(
         window: Window,
         mastergrid_path: str, 
         template_path: str):
@@ -169,12 +159,28 @@ def nibble_zones(
     master, _, mnodata = _read_by_block(mastergrid_path, window)
     templa, _, tnodata = _read_by_block(template_path, window)
 
-    mask = np.logical_and(master == mnodata, templa == tnodata)
-    if not np.any(mask):
-        return master
+    to_fill = np.logical_or(master != mnodata, templa == tnodata)
+    if np.all(to_fill):
+        return window,master
 
-    filled = fill_nearest(master, mask)
-    return filled
+    master[master == mnodata] = 0
+    filled = fill_nearest(master, to_fill)
+    filled[templa == tnodata] = mnodata
+
+    return window,filled
+
+def _apply_mask_block(
+        window: Window,
+        mastergrid_path: str, 
+        mask_path: str):
+    """Apply a mask raster to the mastergrid, setting any pixels outside
+    the mask to -1 (no zone)."""
+
+    master, _, mnodata = _read_by_block(mastergrid_path, window)
+    mask, _, msk_nodata = _read_by_block(mask_path, window)
+    master[mask == msk_nodata] = mnodata
+
+    return window,master
 
 def _compute_partial_zone_sums(
     window: Window,
@@ -184,7 +190,6 @@ def _compute_partial_zone_sums(
     """Pass 1 worker: sum of weight pixels per zone, within one window."""
     weight, _, wnodata = _read_by_block(weight_path, window)
     master, _, mnodata = _read_by_block(mastergrid_path, window)
-    
     valid = np.logical_and(weight != wnodata, master != mnodata)
     
     df = pd.DataFrame()
@@ -195,7 +200,7 @@ def _compute_partial_zone_sums(
     return agg
 
 
-def _redistribute_window(
+def _redistribute_block(
     window: Window,
     weight_path: str,
     mastergrid_path: str,
@@ -237,10 +242,16 @@ class DasymetricRedistributor:
         self.n_windows = len(list(self.weight_source.windows()))
 
         if not self.vector_layer.has_mastergrid:
+            gdf = gpd.read_file(self.vector_layer.geom_path)
+            if self.config.id_field not in gdf.columns:
+                raise ValueError(f"ID field '{self.config.id_field}' not found in geometry data")
             self._create_mastergrid()
 
-        if self.config.nibble_mastergrid:
+        if self.config.nibble:
             self._nibble_mastergrid()
+
+        if self.config.mask_path is not None:
+            self._apply_mask()
 
         self._zone_sums = None
 
@@ -296,15 +307,14 @@ class DasymetricRedistributor:
         profile.update(dtype="int32", nodata=-1)
 
         with rasterio.open(out_path, "w", **profile) as dst:
-            if self.n_windows < self.config.max_windows:
+            if self.n_windows < self.config.max_blocks:
                 logger.info("Rasterizing mastergrid in a single pass (small raster)...")
-                w, zone_raster = _rasterize_zones(
+                w, zone_raster = _rasterize_block(
                     None,
                     self.vector_layer.geom_path, 
                     self.vector_layer.id_field, 
                     self.weight_source.transform, 
-                    (self.weight_source.height, self.weight_source.width),
-                    mask_path=self.config.mask_path
+                    (self.weight_source.height, self.weight_source.width)
                     )
 
                 dst.write(zone_raster.astype("int32"), 1)
@@ -313,14 +323,13 @@ class DasymetricRedistributor:
                 with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
                     futures = [
                         ex.submit(
-                            _rasterize_zones,
+                            _rasterize_block,
                             w,
                             self.vector_layer.geom_path,
                             self.vector_layer.id_field,
                             window_transform(w, self.weight_source.transform),
                             (w.height, w.width),
-                            window_bounds(w, self.weight_source.transform),
-                            self.config.mask_path
+                            window_bounds(w, self.weight_source.transform)
                         )
                         for w in windows
                     ]
@@ -333,20 +342,16 @@ class DasymetricRedistributor:
     def _nibble_mastergrid(self) -> None:
         """Fill any -1 pixels in the mastergrid with the nearest valid zone id,
         constrained to pixels that have valid weight values."""
-        if not self.vector_layer.has_mastergrid:
-            return
 
-        logger.info("Nibbling mastergrid to fill gaps...")
         windows = list(self.weight_source.windows())
         out_path = self.config.output_raster_path.replace(".tif", "_mastergrid_nibbled.tif")
-        self.config.geom_path = out_path
         profile = self.weight_source.profile.copy()
         profile.update(dtype="int32", nodata=-1)
 
         with rasterio.open(out_path, "w", **profile) as dst:
-            if self.n_windows < self.config.max_windows:
+            if self.n_windows < self.config.max_blocks:
                 logger.info("Nibbling mastergrid in a single pass (small raster)...")
-                w, arr = nibble_zones(
+                w, arr = _nibble_block(
                     None,
                     self.config.geom_path,
                     self.config.weight_raster_path
@@ -357,7 +362,7 @@ class DasymetricRedistributor:
                 with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
                     futures = [
                         ex.submit(
-                            nibble_zones,
+                            _nibble_block,
                             w,
                             self.config.geom_path,
                             self.config.weight_raster_path
@@ -367,6 +372,41 @@ class DasymetricRedistributor:
                     for fut in as_completed(futures):
                         w, arr = fut.result()
                         dst.write(arr.astype("int32"), 1, window=w)
+
+        self.config.geom_path = out_path
+
+    def _apply_mask(self) -> None:
+        """Apply a mask raster to the mastergrid, setting any pixels outside
+        the mask to -1 (no zone)."""
+        windows = list(self.weight_source.windows())
+        out_path = self.config.output_raster_path.replace(".tif", "_mastergrid_masked.tif")
+        profile = self.weight_source.profile.copy()
+        profile.update(dtype="int32", nodata=-1)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            if self.n_windows < self.config.max_blocks:
+                logger.info("Applying mask in a single pass (small raster)...")
+                w, arr = _apply_mask_block(
+                    None, self.config.geom_path, self.config.mask_path
+                )
+                dst.write(arr.astype("int32"), 1)
+            else:
+                logger.info("Applying mask in parallel (%d windows, %d workers)...", self.n_windows, self.config.n_workers)
+                with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
+                    futures = [
+                        ex.submit(
+                            _apply_mask_block,
+                            w,
+                            self.config.geom_path,
+                            self.config.mask_path
+                        )
+                        for w in windows
+                    ]
+                    for fut in as_completed(futures):
+                        w, arr = fut.result()
+                        dst.write(arr.astype("int32"), 1, window=w)
+
+        self.config.geom_path = out_path
 
     def _compute_zone_sums(self):
         windows = list(self.weight_source.windows())
@@ -406,9 +446,9 @@ class DasymetricRedistributor:
 
         with rasterio.open(self.config.output_raster_path, "w", **profile) as dst:
 
-            if self.n_windows < self.config.max_windows:
+            if self.n_windows < self.config.max_blocks:
                 logger.info("Redistributing population in a single pass (small raster)...")
-                w, arr = _redistribute_window(
+                w, arr = _redistribute_block(
                     None,
                     self.config.weight_raster_path,
                     self.config.geom_path,
@@ -423,7 +463,7 @@ class DasymetricRedistributor:
                 with ProcessPoolExecutor(max_workers=self.config.n_workers) as ex:
                     futures = [
                         ex.submit(
-                            _redistribute_window,
+                            _redistribute_block,
                             w,
                             self.config.weight_raster_path,
                             self.config.geom_path,
@@ -446,17 +486,19 @@ def _cli() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Dasymetric population redistribution")
-    parser.add_argument("weight_raster")
-    parser.add_argument("pop_path")
-    parser.add_argument("geom_path")
-    parser.add_argument("pop_field")
-    parser.add_argument("output_raster")
-    parser.add_argument("--mask-path", default=None)    
-    parser.add_argument("--id-field", default=None)
-    parser.add_argument("--block-size", type=int, default=512)
-    parser.add_argument("--workers", type=int, default=max(1, (mp.cpu_count() or 2) - 1))
-    parser.add_argument("--nodata", type=float, default=-1.0)
-    parser.add_argument("--weight-floor", type=float, default=0.0)
+    parser.add_argument("weight_raster", help="Path to the ancillary weight raster (e.g., VIIRS nightlights)")
+    parser.add_argument("pop_path", help="Path to the population data file")
+    parser.add_argument("geom_path", help="Path to the geometry file")
+    parser.add_argument("id_field", help="Field name for the zone IDs in the geometry file")
+    parser.add_argument("pop_field", help="Field name for the population data in the population file")
+    parser.add_argument("output_raster", help="Path to the output raster file")
+    parser.add_argument("--mask-path", default=None, help="Optional raster to constrain redistribution")
+    parser.add_argument("--nibble", default=False, help="Fill invalid pixels in mastergrid with nearest valid zone id")
+    parser.add_argument("--block-size", type=int, default=512, help="Pixels per side of a processing window")
+    parser.add_argument("--workers", type=int, default=max(1, (mp.cpu_count() or 2) - 1), help="Number of parallel worker processes")
+    parser.add_argument("--nodata", type=float, default=-1.0, help="No-data value")
+    parser.add_argument("--output-dtype", type=str, default="float32", help="Data type for the output raster")
+    parser.add_argument("--max-blocks", type=int, default=256, help="Maximum number of blocks to process in parallel")
     args = parser.parse_args()
 
     config = DasymetricConfig(
@@ -464,17 +506,21 @@ def _cli() -> None:
         pop_path=args.pop_path,
         geom_path=args.geom_path,
         output_raster_path=args.output_raster,
-        pop_field=args.pop_field,
         id_field=args.id_field,
+        pop_field=args.pop_field,
         mask_path=args.mask_path,
+        nibble=args.nibble,
         block_size=args.block_size,
         n_workers=args.workers,
         nodata=args.nodata,
-        weight_floor=args.weight_floor,
+        output_dtype=args.output_dtype,
+        max_blocks=args.max_blocks,
     )
-    job = DasymetricRedistributor(config).run()
-    logger.info("Verification: %s", job.verify())
-
-
+    
+    job = DasymetricRedistributor(config)
+    if job is not None:
+        job.run()
+        logger.info("Verification: %s", job.verify())
+    
 if __name__ == "__main__":
     _cli()
