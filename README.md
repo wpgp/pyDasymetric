@@ -22,38 +22,80 @@ If the raster has more blocks/windows than `max_blocks`, the algorithm runs in t
 
 Usage
 -----
+This tool can be used in command line:
+
+    dasymetric.py [-h] [--mask-path MASK_PATH] 
+                    [--nibble NIBBLE] [--block-size BLOCK_SIZE] 
+                    [--workers WORKERS]
+                    [--nodata NODATA] [--output-dtype OUTPUT_DTYPE] 
+                    [--max-blocks MAX_BLOCKS]
+                    weight_raster pop_path geom_path 
+                    id_field pop_field output_raster
+
+    Dasymetric population redistribution
+
+    positional arguments:
+    weight_raster         Path to the ancillary weight raster
+    pop_path              Path to the population data file
+    geom_path             Path to the geometry file
+    id_field              Field name for the zone IDs in the geometry file
+    pop_field             Field name for the population data in the 
+                          population file
+    output_raster         Path to the output raster file
+
+    options:
+    -h, --help             show this help message and exit
+    --mask-path MASK_PATH  Optional raster to constrain redistribution
+    --nibble NIBBLE        Fill invalid pixels in mastergrid with nearest 
+                           valid zone id
+    --block-size BLOCK_SIZE  Pixels per side of a processing window
+    --workers WORKERS      Number of parallel worker processes
+    --nodata NODATA        No-data value
+    --output-dtype OUTPUT_DTYPE  Data type for the output raster
+    --max-blocks MAX_BLOCKS  Maximum number of blocks to process in parallel
+
+or as a code block:
+
     from dasymetric import DasymetricConfig, DasymetricRedistributor
 
     config = DasymetricConfig(
-        weight_raster_path="covariates/viirs_2024.tif",
-        pop_path="data/pop_count.csv",
-        geom_path="data/adm_boundary.shp",
-        mask_path="masks/settlement_mask.tif",
-        pop_field="POP_FIELD",
-        id_field="ID_FIELD",
-        output_raster_path="out/urban_pop_disaggregated.tif",
-        nibble=False,
-        n_workers=8,
-        max_blocks=128
-        block_size=512,
-        nodata=-99,
-        output_dtype='float64'
+        weight_raster_path="covariates/weight_raster.tif", #required
+        pop_path="data/pop_count.csv",                  #required
+        geom_path="data/adm_boundary.shp",              #required 
+        pop_field="POP_FIELD",                          #required
+        id_field="ID_FIELD",                            #required
+        output_raster_path="out/pop_disaggregated.tif", #required
+        nibble=False,                                   #optional
+        n_workers=8,                                    #optional
+        max_blocks=128,                                 #optional
+        block_size=512,                                 #optional
+        nodata=-99,                                     #optional
+        output_dtype='float64'                          #optional
     )
 
-    DasymetricRedistributor(config).run()
+    job = DasymetricRedistributor(config)
+    job.run()
+    job.verify()
 
-Or from the command line:
+Example
+-----
+Suppose we have a weighting layer (`covariates/weight_raster.tif`) representing the probability of population residing at particular location. At a certain administrative level (defined by `data/adm_boundary.shp`), the total population is known either from census or demographic projection (summarised in `data/pop_count.csv`). We can dasymetrically redistribute the population using the weighting layer.
+
+The following command can be used:
 
     python dasymetric.py \\
-    path/to/weight_raster.tif \\
-    path/to/mastergrid.tif \\
-    path/to/pop_count.csv \\
+    covariates/weight_raster.tif \\
+    data/adm_boundary.shp \\
+    data/pop_count.csv \\
     ID_FIELD \\
     POP_FIELD \\
-    path/to/output_population.tif \\
+    out/pop_disaggregated.tif \\
     --workers 4 \\
     --block-size 512
 
+Sometimes, we want to constrain the redistribution over the area where settlement exists. For this case, `mask_path` argument specifying the path to masking layer can be supplied to `DasymetricConfig()`. Alternatively, `--path-mask` argument is available in the command line version.
+
+In case we already have a mastergrid, which is a raster representation of the administrative units with population counts, we can set `geom_path = path_to_mastergrid.tif` to avoid redoing rasterisation of administrative boundaries.
 
 ## Contributing
 
