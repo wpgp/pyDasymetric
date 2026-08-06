@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1298383082.svg)](https://doi.org/10.5281/zenodo.21815904)
+
 # pyDasymetric
 ![Illustration](fig/illustration.png)
 
@@ -72,6 +74,7 @@ If you use pyDasymetric in your research, please cite:
 	year         = 2026,
 	month        = 6,
 	publisher    = {GitHub},
+    doi          = {10.5281/zenodo.21815905},
 	url          = {https://github.com/wpgp/pyDasymetric},
 	version      = {0.0.1}
 }
