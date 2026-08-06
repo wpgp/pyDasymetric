@@ -51,3 +51,32 @@ Or from the command line:
     path/to/output_population.tif \\
     --workers 4 \\
     --block-size 512
+
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+If you use pyDasymetric in your research, please cite:
+
+```bibtex
+@software{pyDasymetric,
+	title        = {pyDasymetric: Python package to perform dasymetric redistribution of populations.},
+	author       = {Priyatikanto R., Bondarenko M., Nosatiuk B..},
+	year         = 2026,
+	month        = 6,
+	publisher    = {GitHub},
+	url          = {https://github.com/wpgp/pyDasymetric},
+	version      = {0.0.1}
+}
+```
+
+## Acknowledgments
+
+- Developed by WorldPop SDI [sdi.worldpop.org](https://sdi.worldpop.org)
